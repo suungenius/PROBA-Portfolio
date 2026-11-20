@@ -1,81 +1,86 @@
-# Модель данных и аналитические SQL-примеры
+# Модель данных и PostgreSQL
 
-Документ демонстрирует выделение сущностей, связей, инвариантов и метрик на основе существующей схемы PostgreSQL. Все примеры обезличены; **запросы не выполнялись на пользовательской или production-БД при подготовке портфолио**.
-
-## Логическая ER-модель
+## Какие данные меняются
 
 ```mermaid
 erDiagram
-    PROFESSION ||--o{ PROBA_VERSION : has
+    PROFESSION ||--o{ PROBA_VERSION : versions
     PROBA_VERSION ||--|{ TASK_VERSION : contains
-    PROBA_VERSION ||--o{ PROBA_RUN : used_by
-    PROBA_RUN ||--o{ TASK_RUN : has
+    PROBA_VERSION ||--o{ PROBA_RUN : pinned_by
+    PROBA_RUN ||--o{ TASK_RUN : progress
     TASK_VERSION ||--o{ TASK_RUN : instances
-    TASK_RUN ||--o| DRAFT : current_draft
-    TASK_RUN ||--o{ SUBMISSION : attempts
-    SUBMISSION ||--o{ EVALUATION : reviewed_by
-    TASK_RUN ||--o{ ARTIFACT : produces
+    TASK_RUN ||--o| DRAFT : current_work
+    TASK_RUN ||--o{ SUBMISSION : submissions
+    SUBMISSION ||--|| EVALUATION_JOB : scheduled_for
+    EVALUATION_JOB ||--o| EVALUATION : outcome
+    SUBMISSION ||--o| ARTIFACT : accepted_work
+    ARTIFACT o|--o{ ARTIFACT : parent_of
 ```
 
-В исходной реализации у оценивания дополнительно есть очередь заданий, попытки проверки, версии политик и другие таблицы. Диаграмма специально сокращена для интервью.
+Кардинальности относятся к прохождению и опубликованному контенту. На схеме опущены попытки обработки задания на проверку, дополнительные связи между артефактами и выдача материалов.
 
-## Словарь сущностей
+| Данные | Правило целостности |
+|---|---|
+| `proba_versions`, `task_versions` | Опубликованная версия закреплена за прохождением. Позиция задания уникальна внутри версии |
+| `proba_runs`, `task_runs` | Пара прохождение и версия задания уникальна. Составные внешние ключи связывают их с одной версией ПРОБЫ |
+| `drafts`, `submissions` | Один изменяемый черновик на задание. Сдача фиксирует его ревизию. Номер попытки и ключ идемпотентности уникальны в рамках задания прохождения |
+| `evaluation_jobs`, `evaluations` | Одно задание на оценку на сдачу, не более одной итоговой оценки на задание на оценку. Сохраняются сведения о провайдере, модели и версиях критериев |
+| `artifacts` | Принятая работа ссылается на сдачу. Ограничение допускает не более одного артефакта на задание прохождения. Предшественник сохраняет связь между версиями работ |
 
-| Сущность | Ответственность | Существенное ограничение |
-|---|---|---|
-| `proba_versions` | Конкретная опубликованная версия профессии | История не должна переписываться |
-| `task_versions` | Версионированные задания | Позиция уникальна внутри версии |
-| `proba_runs` | Экземпляр прохождения пользователя | Сервер управляет текущей позицией |
-| `task_runs` | Состояние задания в прохождении | Одна задача — один экземпляр в рамках run |
-| `drafts` | Текущий редактируемый черновик | Оптимистическая ревизия |
-| `submissions` | Неизменяемые попытки сдачи | Ключ идемпотентности и номер попытки |
-| `evaluations` | Итоги проверки | Ссылка на сдачу и версии критериев |
-| `artifacts` | Принятые результаты | Связь с работой и историей изменений |
+## Где проходят границы транзакций
 
-## SQL 1: недельные когорты активаций
+При активации сервер сериализует команды одного пользователя. Проверка действующего прохождения, выбор свободного слота, расход права доступа и создание нового прохождения выполняются в одной транзакции. Ограничение по занятым активным слотам поддерживает уникальный индекс. При успешном завершении отдельно фиксируются итог задания, принятый артефакт при его наличии и переход к следующей позиции или завершение прохождения.
+
+## Доля прохождений, завершённых за 14 суток
+
+Пример расчёта для сравнения версий ПРОБЫ. Временная граница задана явно. Включаются только активации, для которых к этой дате прошло 336 часов. Последняя недельная когорта может быть неполной по числу включённых активаций. Часовой пояс недельной группировки — UTC.
 
 ```sql
--- PostgreSQL. Статусы на момент выполнения запроса.
--- Это демонстрационный срез, НЕ окончательная оценка конверсии.
+WITH params AS (
+    SELECT TIMESTAMPTZ '2026-11-20 00:00:00+00' AS cutoff
+),
+cohort AS (
+    SELECT
+        date_trunc('week', r.activated_at AT TIME ZONE 'UTC')::date AS week_utc,
+        r.proba_version_id,
+        r.completed_at BETWEEN r.activated_at
+            AND r.activated_at + INTERVAL '336 hours' AS completed_in_window
+    FROM proba_runs AS r
+    CROSS JOIN params AS p
+    WHERE r.activated_at + INTERVAL '336 hours' <= p.cutoff
+)
 SELECT
-    date_trunc('week', activated_at)::date AS activation_week,
-    COUNT(*) AS runs_started,
-    COUNT(*) FILTER (WHERE status = 'COMPLETED') AS runs_completed_now,
-    ROUND(
-        100.0 * COUNT(*) FILTER (WHERE status = 'COMPLETED')
-        / NULLIF(COUNT(*), 0), 1
-    ) AS completed_share_pct
-FROM proba_runs
-GROUP BY 1
-ORDER BY 1;
+    week_utc,
+    proba_version_id,
+    COUNT(*) AS eligible_runs,
+    COUNT(*) FILTER (WHERE completed_in_window) AS completed_runs,
+    ROUND(100.0 * COUNT(*) FILTER (WHERE completed_in_window) / COUNT(*), 1)
+        AS completion_pct
+FROM cohort
+GROUP BY week_utc, proba_version_id
+ORDER BY week_utc, proba_version_id;
 ```
 
-**Ограничения интерпретации:** новые когорты ещё не успели завершить прохождение; показатель смешивает доступное время, профессию и поведение. Для управленческого вывода нужна единая длительность наблюдения и разделение по версии контента / источнику доступа.
+Единица наблюдения — прохождение. Отменённое прохождение остаётся в знаменателе, если окно наблюдения прошло. На смешанном наборе требуется заранее определить, как исключать тестовые аккаунты и технические записи.
 
-## SQL 2: число попыток на задание
+## Число сдач на версию задания
 
 ```sql
--- Используются реальные имена таблиц/полей из схемы.
+WITH per_task_run AS (
+    SELECT tr.task_version_id, COUNT(s.id) AS submission_count
+    FROM task_runs AS tr
+    LEFT JOIN submissions AS s ON s.task_run_id = tr.id
+    GROUP BY tr.id, tr.task_version_id
+)
 SELECT
-    tr.run_id,
-    tr.task_version_id,
-    COUNT(s.id) AS submission_count,
-    MAX(s.attempt_number) AS last_attempt_number
-FROM task_runs AS tr
-LEFT JOIN submissions AS s
-    ON s.task_run_id = tr.id
-GROUP BY tr.run_id, tr.task_version_id
-ORDER BY tr.run_id, tr.task_version_id;
+    task_version_id,
+    COUNT(*) AS task_runs,
+    COUNT(*) FILTER (WHERE submission_count = 0) AS without_submission,
+    COUNT(*) FILTER (WHERE submission_count > 1) AS with_resubmission,
+    MAX(submission_count) AS max_submissions
+FROM per_task_run
+GROUP BY task_version_id
+ORDER BY task_version_id;
 ```
 
-**Зачем:** выделить задания с повторными попытками и проверить гипотезу о неоднозначной постановке или завышенной сложности. Наличие многих попыток само по себе не доказывает плохое качество задания: нужно учитывать причину замечаний и качество обратной связи.
-
-## Правила качества данных
-
-- В аналитике считать повторённые команды один раз по стабильному идентификатору.
-- Не включать в продуктовые метрики текст черновиков, содержимое сдач и контактные данные.
-- Не трактовать `PAUSED` как отказ от прохождения без дополнительного определения.
-- Разделять синтетические тестовые аккаунты и реальные пользовательские когорты.
-- Сохранять связь результата с версией задания и проверки.
-
-**Предел демонстрации:** здесь показаны проверяемые SQL-подходы, не реальные бизнес-показатели продукта.
+`LEFT JOIN` включает задания, созданные в прохождении, но ещё ни разу не сданные. Запрос показывает, где смотреть причины повторных сдач. Повторы могут объясняться сложностью задания, замечаниями или обычной работой над правками. Оба примера используют имена столбцов PostgreSQL из проекта. [Проверки и границы доказательств](05-quality-assurance.md).
